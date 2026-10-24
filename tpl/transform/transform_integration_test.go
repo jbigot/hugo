@@ -543,6 +543,7 @@ DATA
 		err              string
 	}{
 		{"document", `dict "targetType" "document"`, para, paraJSON, ""},
+		{"document with BOM", `dict "targetType" "document"`, "\ufeff" + para, paraJSON, ""},
 		{"document (no data)", `dict "targetType" "document"`, "", "! tag", ""},
 		{"slice", `dict "targetType" "slice"`, para, "", `invalid targetType: expected either data or document, received slice`},
 		{"foo (no data)", `dict "targetType" "foo"`, "", "", `invalid targetType: expected either data or document, received foo`},

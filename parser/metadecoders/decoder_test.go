@@ -14,7 +14,10 @@
 package metadecoders
 
 import (
+	"encoding/json"
+	stdxml "encoding/xml"
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -128,26 +131,50 @@ var xmlDocumentCases = []struct {
 	{"empty root, self-closing", `<r/>`, xmlEl("r", nil)},
 	{"empty root, end tag", `<r></r>`, xmlEl("r", nil)},
 	{"text-only root", `<r>t</r>`, xmlEl("r", nil, "t")},
+	{"numeric text stays a string", `<r>1</r>`, xmlEl("r", nil, "1")},
 	{"nesting", `<a><b><c/></b></a>`, xmlEl("a", nil, xmlEl("b", nil, xmlEl("c", nil)))},
 	{"sibling order and repetition", `<r><b/><a/><b/></r>`, xmlEl("r", nil, xmlEl("b", nil), xmlEl("a", nil), xmlEl("b", nil))},
 	{"issue example", xmlIssuePara, xmlEl("para", nil, "Use ", xmlEl("ref", map[string]string{"kindref": "member", "refid": "namespacedemo_1a5d"}, "make_widget"), " to build one, it is ", xmlEl("bold", nil, "fast"), " and ", xmlEl("computeroutput", nil, "cheap"), ".")},
 	{"text around a child", `<r>a<b/>c</r>`, xmlEl("r", nil, "a", xmlEl("b", nil), "c")},
 	{"nested mixed content", `<p>x<em>y<b>z</b></em>w</p>`, xmlEl("p", nil, "x", xmlEl("em", nil, "y", xmlEl("b", nil, "z")), "w")},
 	{"indentation kept", "<r>\n  <a/>\n</r>", xmlEl("r", nil, "\n  ", xmlEl("a", nil), "\n")},
+	{"whitespace-only element", `<r> </r>`, xmlEl("r", nil, " ")},
+	{"tabs and newlines in text", "<r>\t\n </r>", xmlEl("r", nil, "\t\n ")},
 	{"markup and whitespace outside the root dropped", "<?xml version=\"1.0\"?>\n<!-- c -->\n<?pi x?>\n<r/>\n<!-- c -->\n<?pi y?>\n", xmlEl("r", nil)},
+	{"full XML declaration", `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><r/>`, xmlEl("r", nil)},
+	{"predefined entities", `<r>&lt;&gt;&amp;&apos;&quot;</r>`, xmlEl("r", nil, `<>&'"`)},
+	{"character references", `<r>&#233;&#x263A;&#x1F600;</r>`, xmlEl("r", nil, "é☺😀")},
+	{"literal non-ASCII text", `<r>é ☺ 😀</r>`, xmlEl("r", nil, "é ☺ 😀")},
+	{"CRLF and CR in text", "<r>1\r\n2\r3</r>", xmlEl("r", nil, "1\n2\n3")},
+	{"CDATA alone", `<r><![CDATA[<b>&amp;</b>]]></r>`, xmlEl("r", nil, "<b>&amp;</b>")},
 	{"CDATA merged with text", `<r>a<![CDATA[b]]>c</r>`, xmlEl("r", nil, "abc")},
 	{"adjacent CDATA sections", `<r><![CDATA[a]]><![CDATA[b]]></r>`, xmlEl("r", nil, "ab")},
+	{"]]> split across CDATA", `<r><![CDATA[a]]]]><![CDATA[>b]]></r>`, xmlEl("r", nil, "a]]>b")},
 	{"empty CDATA leaves no string", `<r><![CDATA[]]></r>`, xmlEl("r", nil)},
 	{"comment merges text", `<r>a<!--c-->b</r>`, xmlEl("r", nil, "ab")},
 	{"PI merges text", `<r>a<?pi x?>b</r>`, xmlEl("r", nil, "ab")},
 	{"comment between elements", `<r><a/><!--c--><b/></r>`, xmlEl("r", nil, xmlEl("a", nil), xmlEl("b", nil))},
 	{"lone comment leaves no string", `<r><!--c--></r>`, xmlEl("r", nil)},
 	{"DOCTYPE dropped", "<!DOCTYPE r>\n<r/>", xmlEl("r", nil)},
+	{"DOCTYPE with internal subset", `<!DOCTYPE r [<!ELEMENT r ANY><!ENTITY e "x">]><r/>`, xmlEl("r", nil)},
+	{"DOCTYPE with external id", `<!DOCTYPE r SYSTEM "r.dtd"><r/>`, xmlEl("r", nil)},
 	{"root attributes", `<r a="1" b="2"/>`, xmlEl("r", map[string]string{"a": "1", "b": "2"})},
+	{"single-quoted value", `<r a='x "y"'/>`, xmlEl("r", map[string]string{"a": `x "y"`})},
+	{"> in a value", `<r a="x > y"/>`, xmlEl("r", map[string]string{"a": "x > y"})},
+	{"references in a value", `<r a="&lt;&amp;&#233;&#x263A;&quot;"/>`, xmlEl("r", map[string]string{"a": `<&é☺"`})},
+	{"empty value", `<r a=""/>`, xmlEl("r", map[string]string{"a": ""})},
+	{"spaces around =", `<r a = "1"/>`, xmlEl("r", map[string]string{"a": "1"})},
+	{"multi-line start tag", "<r\n  a=\"1\"\n  b=\"2\"/>", xmlEl("r", map[string]string{"a": "1", "b": "2"})},
+	{"newline reference in a value", `<r a="p&#10;q"/>`, xmlEl("r", map[string]string{"a": "p\nq"})},
 	{"prefixes and xmlns kept", `<r xmlns="u" xmlns:x="v" xml:lang="fr"><x:e/></r>`, xmlEl("r", map[string]string{"xmlns": "u", "xmlns:x": "v", "xml:lang": "fr"}, xmlEl("x:e", nil))},
 	{"undeclared element prefix", `<y:r/>`, xmlEl("y:r", nil)},
 	{"undeclared attribute prefix", `<r x:a="1"/>`, xmlEl("r", map[string]string{"x:a": "1"})},
 	{"same local name, other prefixes", `<r a="1" x:a="2" y:a="3"/>`, xmlEl("r", map[string]string{"a": "1", "x:a": "2", "y:a": "3"})},
+	{"case kept", `<Mixed Case="yes"><mixed/></Mixed>`, xmlEl("Mixed", map[string]string{"Case": "yes"}, xmlEl("mixed", nil))},
+	{"name characters", `<a-b.c_d1/>`, xmlEl("a-b.c_d1", nil)},
+	{"non-ASCII names", `<é ü="1"/>`, xmlEl("é", map[string]string{"ü": "1"})},
+	{"whitespace before > in an end tag", `<r></r >`, xmlEl("r", nil)},
+	{"BOM at the start (string input)", "\ufeff<r/>", xmlEl("r", nil)},
 }
 
 // Malformed input accepted, as by the default layout.
@@ -179,6 +206,10 @@ func TestUnmarshalXMLDocumentTargets(t *testing.T) {
 	var m map[string]any
 	c.Assert(Default.unmarshalXMLDocument([]byte(`<e/>`), &m), qt.IsNil)
 	c.Assert(m, qt.DeepEquals, xmlEl("e", nil))
+
+	b, err := json.Marshal(m)
+	c.Assert(err, qt.IsNil)
+	c.Assert(string(b), qt.Equals, `{"attributes":{},"children":[],"tag":"e"}`)
 }
 
 func TestUnmarshalXMLDocumentDeep(t *testing.T) {
@@ -216,9 +247,50 @@ var xmlDocumentErrorCases = []struct {
 	{"unclosed element", "<a>\n<b></b>\n", `"_stream.xml:3:1": unmarshal failed: unclosed element <a>`},
 	{"innermost unclosed element named", `<a><b>`, `"_stream.xml:1:7": unmarshal failed: unclosed element <b>`},
 	{"empty", "", `"_stream.xml:1:1": unmarshal failed: no root element`},
+	{"text only", `x`, `"_stream.xml:1:2": unmarshal failed: no root element`},
 	{"whitespace only", "  \n", `"_stream.xml:2:1": unmarshal failed: no root element`},
 	{"comment only", `<!-- c -->`, `"_stream.xml:1:11": unmarshal failed: no root element`},
+	{"PI only", `<?pi x?>`, `"_stream.xml:1:9": unmarshal failed: no root element`},
+	{"DOCTYPE only", `<!DOCTYPE r>`, `"_stream.xml:1:13": unmarshal failed: no root element`},
 	{"error from encoding/xml", "<r>\n &foo;</r>", `unmarshal failed: XML syntax error on line 2: invalid character entity &foo;`},
+}
+
+// Errors from encoding/xml: only the line of their position is checked.
+var xmlDocumentSyntaxErrorCases = []struct {
+	name, in string
+	line     int
+}{
+	{"unknown entity", "<r>\n &foo;</r>", 2},
+	{"HTML entity", `<r>&nbsp;</r>`, 1},
+	{"entity from the internal subset", `<!DOCTYPE r [<!ENTITY foo "x">]><r>&foo;</r>`, 1},
+	{"bare ampersand", `<r>a & b</r>`, 1},
+	{"ampersand in a value", `<r a="&"/>`, 1},
+	{"bare less-than", `<r>a < b</r>`, 1},
+	{"less-than in a value", `<r a="<"/>`, 1},
+	{"]]> in text", `<r>]]></r>`, 1},
+	{"unterminated value", `<r a="x/>`, 1},
+	{"attribute without a value", `<r a/>`, 1},
+	{"unquoted value", `<r a=1/>`, 1},
+	{"unclosed comment", `<r><!-- x</r>`, 1},
+	{"-- in a comment", `<r><!-- a -- b --></r>`, 1},
+	{"unclosed CDATA", `<r><![CDATA[x</r>`, 1},
+	{"invalid name", `<1a/>`, 1},
+	{"empty name", `<></>`, 1},
+	{"attribute in an end tag", `<r></r a="1">`, 1},
+	{"illegal character", "<r>\x01</r>", 1},
+	{"reference to an illegal character", `<r>&#1;</r>`, 1},
+	{"reference out of range", `<r>&#x110000;</r>`, 1},
+	{"invalid UTF-8", "<r>\xff</r>", 1},
+	{"non-UTF-8 encoding", `<?xml version="1.0" encoding="ISO-8859-1"?><r/>`, 1},
+}
+
+func xmlRawTokenError(in string) error {
+	dec := stdxml.NewDecoder(strings.NewReader(in))
+	for {
+		if _, err := dec.RawToken(); err != nil {
+			return err
+		}
+	}
 }
 
 func TestUnmarshalXMLDocumentErrors(t *testing.T) {
@@ -231,6 +303,28 @@ func TestUnmarshalXMLDocumentErrors(t *testing.T) {
 			c.Assert(err, qt.IsNotNil)
 			c.Assert(err.Error(), qt.Contains, test.want)
 		})
+	}
+
+	for _, test := range xmlDocumentSyntaxErrorCases {
+		c.Run(test.name, func(c *qt.C) {
+			var v any
+			err := Default.unmarshalXMLDocument([]byte(test.in), &v)
+			c.Assert(err, qt.ErrorMatches, fmt.Sprintf(`"_stream\.xml:%d:\d+": unmarshal failed: %s`, test.line, regexp.QuoteMeta(xmlRawTokenError(test.in).Error())))
+		})
+	}
+
+	in := `<?xml version="1.0" encoding="ISO-8859-1"?><r/>`
+	_, err := Default.Unmarshal([]byte(in), XML)
+	c.Assert(err, qt.ErrorMatches, `.* `+regexp.QuoteMeta(xmlRawTokenError(in).Error()))
+}
+
+func TestUnmarshalXMLDocumentNoRoot(t *testing.T) {
+	c := qt.New(t)
+
+	d := Decoder{Delimiter: ',', TargetType: "document"}
+	for _, in := range []string{"  \n", "<!-- c -->"} {
+		_, err := d.Unmarshal([]byte(in), XML)
+		c.Assert(err, qt.ErrorMatches, `.*no root element`, qt.Commentf("%q", in))
 	}
 }
 
@@ -292,6 +386,35 @@ func TestUnmarshalXMLDocumentFileError(t *testing.T) {
 	c.Assert(fe, qt.IsNotNil)
 	c.Assert(fe.Position().LineNumber, qt.Equals, 2)
 	c.Assert(fe.Position().ColumnNumber, qt.Equals, 10)
+}
+
+// TestUnmarshalXMLDefaultLayout pins the output of the default XML layout.
+func TestUnmarshalXMLDefaultLayout(t *testing.T) {
+	c := qt.New(t)
+
+	for _, test := range []struct {
+		in   string
+		want any // or an error substring, as a string
+	}{
+		{xmlIssuePara, map[string]any{
+			"#text": "Use", "bold": "fast", "computeroutput": "cheap",
+			"ref": map[string]any{"#text": "make_widget", "-kindref": "member", "-refid": "namespacedemo_1a5d"},
+		}},
+		{`<r><b>1</b><a/><b>2</b></r>`, map[string]any{"a": "", "b": []any{"1", "2"}}},
+		{`<r xmlns:x="u"><x:a> t </x:a></r>`, map[string]any{"-x": "u", "a": "t"}},
+		{`<r>t</r>`, "must be a map/object"},
+	} {
+		c.Run(test.in, func(c *qt.C) {
+			v, err := Default.Unmarshal([]byte(test.in), XML)
+			if s, ok := test.want.(string); ok {
+				c.Assert(err, qt.IsNotNil)
+				c.Assert(err.Error(), qt.Contains, s)
+				return
+			}
+			c.Assert(err, qt.IsNil)
+			c.Assert(v, qt.DeepEquals, test.want)
+		})
+	}
 }
 
 func TestUnmarshalToMap(t *testing.T) {
