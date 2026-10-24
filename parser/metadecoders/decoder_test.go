@@ -14,9 +14,13 @@
 package metadecoders
 
 import (
+	"fmt"
+	"slices"
+	"strings"
 	"testing"
 
 	qt "github.com/frankban/quicktest"
+	"github.com/gohugoio/hugo/common/herrors"
 )
 
 func TestUnmarshalXML(t *testing.T) {
@@ -73,6 +77,221 @@ func TestUnmarshalXML(t *testing.T) {
 	m, err := d.Unmarshal([]byte(xmlDoc), XML)
 	c.Assert(err, qt.IsNil)
 	c.Assert(m, qt.DeepEquals, expect)
+}
+
+func xmlEl(tag string, attrs map[string]string, children ...any) map[string]any {
+	if attrs == nil {
+		attrs = map[string]string{}
+	}
+	if children == nil {
+		children = []any{}
+	}
+	return map[string]any{"tag": tag, "attributes": attrs, "children": children}
+}
+
+// checkXMLDocument checks the invariants of the document XML layout.
+func checkXMLDocument(c *qt.C, v any) {
+	c.Helper()
+	stack := []any{v}
+	for len(stack) > 0 {
+		el, ok := stack[len(stack)-1].(map[string]any)
+		stack = stack[:len(stack)-1]
+		c.Assert(ok, qt.IsTrue, qt.Commentf("element is not a map[string]any"))
+		c.Assert(el, qt.HasLen, 3)
+		_, ok = el["tag"].(string)
+		c.Assert(ok, qt.IsTrue, qt.Commentf("tag: %T", el["tag"]))
+		attrs, ok := el["attributes"].(map[string]string)
+		c.Assert(ok && attrs != nil, qt.IsTrue, qt.Commentf("attributes: %T", el["attributes"]))
+		children, ok := el["children"].([]any)
+		c.Assert(ok && children != nil, qt.IsTrue, qt.Commentf("children: %T", el["children"]))
+		prevString := false
+		for _, child := range children {
+			switch child := child.(type) {
+			case string:
+				c.Assert(child, qt.Not(qt.Equals), "")
+				c.Assert(prevString, qt.IsFalse, qt.Commentf("consecutive strings"))
+				prevString = true
+			default:
+				stack = append(stack, child)
+				prevString = false
+			}
+		}
+	}
+}
+
+const xmlIssuePara = `<para>Use <ref refid="namespacedemo_1a5d" kindref="member">make_widget</ref> to build one, it is <bold>fast</bold> and <computeroutput>cheap</computeroutput>.</para>`
+
+var xmlDocumentCases = []struct {
+	name, in string
+	want     map[string]any
+}{
+	{"empty root, self-closing", `<r/>`, xmlEl("r", nil)},
+	{"empty root, end tag", `<r></r>`, xmlEl("r", nil)},
+	{"text-only root", `<r>t</r>`, xmlEl("r", nil, "t")},
+	{"nesting", `<a><b><c/></b></a>`, xmlEl("a", nil, xmlEl("b", nil, xmlEl("c", nil)))},
+	{"sibling order and repetition", `<r><b/><a/><b/></r>`, xmlEl("r", nil, xmlEl("b", nil), xmlEl("a", nil), xmlEl("b", nil))},
+	{"issue example", xmlIssuePara, xmlEl("para", nil, "Use ", xmlEl("ref", map[string]string{"kindref": "member", "refid": "namespacedemo_1a5d"}, "make_widget"), " to build one, it is ", xmlEl("bold", nil, "fast"), " and ", xmlEl("computeroutput", nil, "cheap"), ".")},
+	{"text around a child", `<r>a<b/>c</r>`, xmlEl("r", nil, "a", xmlEl("b", nil), "c")},
+	{"nested mixed content", `<p>x<em>y<b>z</b></em>w</p>`, xmlEl("p", nil, "x", xmlEl("em", nil, "y", xmlEl("b", nil, "z")), "w")},
+	{"indentation kept", "<r>\n  <a/>\n</r>", xmlEl("r", nil, "\n  ", xmlEl("a", nil), "\n")},
+	{"markup and whitespace outside the root dropped", "<?xml version=\"1.0\"?>\n<!-- c -->\n<?pi x?>\n<r/>\n<!-- c -->\n<?pi y?>\n", xmlEl("r", nil)},
+	{"CDATA merged with text", `<r>a<![CDATA[b]]>c</r>`, xmlEl("r", nil, "abc")},
+	{"adjacent CDATA sections", `<r><![CDATA[a]]><![CDATA[b]]></r>`, xmlEl("r", nil, "ab")},
+	{"empty CDATA leaves no string", `<r><![CDATA[]]></r>`, xmlEl("r", nil)},
+	{"comment merges text", `<r>a<!--c-->b</r>`, xmlEl("r", nil, "ab")},
+	{"PI merges text", `<r>a<?pi x?>b</r>`, xmlEl("r", nil, "ab")},
+	{"comment between elements", `<r><a/><!--c--><b/></r>`, xmlEl("r", nil, xmlEl("a", nil), xmlEl("b", nil))},
+	{"lone comment leaves no string", `<r><!--c--></r>`, xmlEl("r", nil)},
+	{"DOCTYPE dropped", "<!DOCTYPE r>\n<r/>", xmlEl("r", nil)},
+	{"root attributes", `<r a="1" b="2"/>`, xmlEl("r", map[string]string{"a": "1", "b": "2"})},
+	{"prefixes and xmlns kept", `<r xmlns="u" xmlns:x="v" xml:lang="fr"><x:e/></r>`, xmlEl("r", map[string]string{"xmlns": "u", "xmlns:x": "v", "xml:lang": "fr"}, xmlEl("x:e", nil))},
+	{"undeclared element prefix", `<y:r/>`, xmlEl("y:r", nil)},
+	{"undeclared attribute prefix", `<r x:a="1"/>`, xmlEl("r", map[string]string{"x:a": "1"})},
+	{"same local name, other prefixes", `<r a="1" x:a="2" y:a="3"/>`, xmlEl("r", map[string]string{"a": "1", "x:a": "2", "y:a": "3"})},
+}
+
+// Malformed input accepted, as by the default layout.
+var xmlDocumentLenientCases = []struct {
+	name, in string
+	want     map[string]any
+}{
+	{"text before the root ignored", `x<r/>`, xmlEl("r", nil)},
+	{"content after the root ignored", "<r/>\nx<b/></r><a", xmlEl("r", nil)},
+}
+
+func TestUnmarshalXMLDocument(t *testing.T) {
+	c := qt.New(t)
+
+	for _, test := range slices.Concat(xmlDocumentCases, xmlDocumentLenientCases) {
+		c.Run(test.name, func(c *qt.C) {
+			var v any
+			err := Default.unmarshalXMLDocument([]byte(test.in), &v)
+			c.Assert(err, qt.IsNil)
+			c.Assert(v, qt.DeepEquals, any(test.want))
+			checkXMLDocument(c, v)
+		})
+	}
+}
+
+func TestUnmarshalXMLDocumentTargets(t *testing.T) {
+	c := qt.New(t)
+
+	var m map[string]any
+	c.Assert(Default.unmarshalXMLDocument([]byte(`<e/>`), &m), qt.IsNil)
+	c.Assert(m, qt.DeepEquals, xmlEl("e", nil))
+}
+
+func TestUnmarshalXMLDocumentDeep(t *testing.T) {
+	c := qt.New(t)
+
+	const depth = 10000
+	in := strings.Repeat("<a>", depth) + "x" + strings.Repeat("</a>", depth)
+
+	var v any
+	c.Assert(Default.unmarshalXMLDocument([]byte(in), &v), qt.IsNil)
+	checkXMLDocument(c, v)
+
+	n := 0
+	for {
+		el, ok := v.(map[string]any)
+		if !ok {
+			break
+		}
+		n++
+		children := el["children"].([]any)
+		c.Assert(children, qt.HasLen, 1)
+		v = children[0]
+	}
+	c.Assert(n, qt.Equals, depth)
+	c.Assert(v, qt.Equals, "x")
+}
+
+var xmlDocumentErrorCases = []struct {
+	name, in, want string
+}{
+	{"mismatched end tag", "<a>\n  <b></c>\n</a>", `"_stream.xml:2:10": unmarshal failed: element <b> closed by </c>`},
+	{"mismatched prefix", `<x:a></y:a>`, `"_stream.xml:1:12": unmarshal failed: element <x:a> closed by </y:a>`},
+	{"end tag without an open element", `</a>`, `"_stream.xml:1:5": unmarshal failed: unexpected end element </a>`},
+	{"end tag closing an inner element early", `<r><a></r>`, `"_stream.xml:1:11": unmarshal failed: element <a> closed by </r>`},
+	{"unclosed element", "<a>\n<b></b>\n", `"_stream.xml:3:1": unmarshal failed: unclosed element <a>`},
+	{"innermost unclosed element named", `<a><b>`, `"_stream.xml:1:7": unmarshal failed: unclosed element <b>`},
+	{"empty", "", `"_stream.xml:1:1": unmarshal failed: no root element`},
+	{"whitespace only", "  \n", `"_stream.xml:2:1": unmarshal failed: no root element`},
+	{"comment only", `<!-- c -->`, `"_stream.xml:1:11": unmarshal failed: no root element`},
+	{"error from encoding/xml", "<r>\n &foo;</r>", `unmarshal failed: XML syntax error on line 2: invalid character entity &foo;`},
+}
+
+func TestUnmarshalXMLDocumentErrors(t *testing.T) {
+	c := qt.New(t)
+
+	for _, test := range xmlDocumentErrorCases {
+		c.Run(test.name, func(c *qt.C) {
+			var v any
+			err := Default.unmarshalXMLDocument([]byte(test.in), &v)
+			c.Assert(err, qt.IsNotNil)
+			c.Assert(err.Error(), qt.Contains, test.want)
+		})
+	}
+}
+
+func TestUnmarshalTargetType(t *testing.T) {
+	c := qt.New(t)
+
+	c.Check(Default.TargetType, qt.Equals, "")
+
+	const (
+		x   = `<r a="1">t</r>`
+		csv = "a,b\n1,2"
+	)
+	xmlTargetTypeErr := "invalid targetType: expected either data or document, received "
+	csvTargetTypeErr := "invalid targetType: expected either slice or map, received "
+
+	for _, test := range []struct {
+		format      Format
+		targetTypes []string
+		data        []string
+		want        any
+		err         string // completed with the targetType
+	}{
+		{XML, []string{"", "data"}, []string{x}, map[string]any{"-a": "1", "#text": "t"}, ""},
+		{XML, []string{"document"}, []string{x}, xmlEl("r", map[string]string{"a": "1"}, "t"), ""},
+		{XML, []string{"", "data", "document"}, []string{""}, map[string]any{}, ""},
+		{XML, []string{"slice", "map", "foo"}, []string{x, ""}, nil, xmlTargetTypeErr},
+		{CSV, []string{"", "slice"}, []string{csv}, [][]string{{"a", "b"}, {"1", "2"}}, ""},
+		{CSV, []string{"", "slice"}, []string{""}, [][]string{}, ""},
+		{CSV, []string{"map"}, []string{csv}, []map[string]string{{"a": "1", "b": "2"}}, ""},
+		{CSV, []string{"map"}, []string{""}, map[string]any{}, ""},
+		{CSV, []string{"data", "document", "foo"}, []string{csv, ""}, nil, csvTargetTypeErr},
+		{JSON, []string{"document", "foo"}, []string{`{"a":1}`}, map[string]any{"a": float64(1)}, ""},
+	} {
+		for _, tt := range test.targetTypes {
+			for _, data := range test.data {
+				c.Run(fmt.Sprintf("%s/%q/%q", test.format, tt, data), func(c *qt.C) {
+					d := Decoder{Delimiter: ',', TargetType: tt}
+					v, err := d.Unmarshal([]byte(data), test.format)
+					if test.err != "" {
+						c.Assert(err, qt.IsNotNil)
+						c.Assert(err.Error(), qt.Contains, test.err+tt)
+						return
+					}
+					c.Assert(err, qt.IsNil)
+					c.Assert(v, qt.DeepEquals, test.want)
+				})
+			}
+		}
+	}
+}
+
+func TestUnmarshalXMLDocumentFileError(t *testing.T) {
+	c := qt.New(t)
+
+	d := Decoder{Delimiter: ',', TargetType: "document"}
+	_, err := d.Unmarshal([]byte("<a>\n  <b></c>\n</a>"), XML)
+	c.Assert(err, qt.IsNotNil)
+	fe := herrors.UnwrapFileError(err)
+	c.Assert(fe, qt.IsNotNil)
+	c.Assert(fe.Position().LineNumber, qt.Equals, 2)
+	c.Assert(fe.Position().ColumnNumber, qt.Equals, 10)
 }
 
 func TestUnmarshalToMap(t *testing.T) {
