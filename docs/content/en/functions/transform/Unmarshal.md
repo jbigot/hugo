@@ -32,6 +32,8 @@ The `transform.Unmarshal` function accepts an options map.
 `targetType`
 : {{< new-in 0.146.7 />}}
 : (`string`) Applicable to CSV files. The target data type, either `slice` or `map`. Default is `slice`.
+: {{< new-in 0.169.0 />}}
+: (`string`) Applicable to XML files. The target layout, either `data` or `document`. Default is `data`. See [document layout](#document-layout).
 
 ## Unmarshal a string
 
@@ -215,7 +217,7 @@ To extract a subset of the data, or to sort the data, unmarshal to a map instead
 
 ## Working with XML
 
-When unmarshaling an XML file, do not include the root node when accessing data. For example, after unmarshaling the RSS feed below, access the feed title with `$data.channel.title`.
+By default, when unmarshaling an XML file, do not include the root node when accessing data. For example, after unmarshaling the RSS feed below, access the feed title with `$data.channel.title`.
 
 ```xml
 <?xml version="1.0" encoding="utf-8" standalone="yes"?>
@@ -367,6 +369,121 @@ Hugo renders this to:
 </ul>
 ```
 
+### Document layout
+
+{{< new-in 0.169.0 />}}
+
+The default layout works well for data, such as feeds and sitemaps. It does not work well for documents, such as DocBook or Doxygen output, where text and elements are mixed. It loses the order of the elements and the text between them. To keep both, set `targetType` to `document`.
+
+Let's unmarshal this paragraph:
+
+```xml
+<para>Call <ref refid="make_widget">make_widget</ref> to build a <bold>fast</bold> widget.</para>
+```
+
+Get the data:
+
+```go-html-template
+{{ $doc := dict }}
+{{ with resources.Get "para.xml" }}
+  {{ $doc = transform.Unmarshal (dict "targetType" "document") . }}
+{{ end }}
+```
+
+Inspect the data structure:
+
+```go-html-template
+<pre>{{ debug.Dump $doc }}</pre>
+```
+
+The result looks like this:
+
+```json
+{
+  "attributes": {},
+  "children": [
+    "Call ",
+    {
+      "attributes": {
+        "refid": "make_widget"
+      },
+      "children": [
+        "make_widget"
+      ],
+      "tag": "ref"
+    },
+    " to build a ",
+    {
+      "attributes": {},
+      "children": [
+        "fast"
+      ],
+      "tag": "bold"
+    },
+    " widget."
+  ],
+  "tag": "para"
+}
+```
+
+The result is the root element. Each element is a map with three keys:
+
+- `tag`: the element name.
+- `attributes`: a map of attribute names to values.
+- `children`: a slice of the text and child elements, in document order.
+
+The `attributes` and `children` keys are always present, even when empty. Text is a string. Hugo merges CDATA sections with the text around them. It drops comments, processing instructions, and the DOCTYPE.
+
+As with the default layout, Hugo drops namespace prefixes: `<isbn:number>` becomes `number` and `xml:lang` becomes `lang`. A namespace declaration such as `xmlns:atom` becomes an attribute named after its prefix, `atom`. When two attributes of an element have the same name once their prefixes are dropped, the last one wins.
+
+Values are strings. Hugo does not trim them or cast them to other types. It decodes character references and the five predefined entities, such as `&lt;` and `&amp;`. Other entities, such as `&nbsp;`, cause an error.
+
+Hugo also keeps whitespace, because it matters in documents. With indented input, `children` holds the line breaks and spaces between elements. Use the [`reflect.IsMap`][] function to skip them:
+
+```go-html-template
+{{ range $doc.children }}
+  {{ if reflect.IsMap . }}
+    {{ .tag }}
+  {{ end }}
+{{ end }}
+```
+
+An empty file returns an empty map. A file with no root element, or with malformed XML, causes an error. Hugo ignores text before the root element and anything after it. Unlike the default layout, a root element that holds only text, such as `<r>t</r>`, works.
+
+> [!NOTE]
+> Files in the `data` directory always use the default layout.
+
+Render the tree with a recursive [partial](g):
+
+```go-html-template {file="layouts/_partials/render.html"}
+{{- range . -}}
+  {{- if reflect.IsMap . -}}
+    {{- if eq .tag "para" -}}
+      <p>{{ partial "render.html" .children }}</p>
+    {{- else if eq .tag "bold" -}}
+      <strong>{{ partial "render.html" .children }}</strong>
+    {{- else if eq .tag "ref" -}}
+      <a href="#{{ .attributes.refid }}">{{ partial "render.html" .children }}</a>
+    {{- end -}}
+  {{- else -}}
+    {{- . -}}
+  {{- end -}}
+{{- end -}}
+```
+
+Call the partial:
+
+```go-html-template
+{{ partial "render.html" (slice $doc) }}
+```
+
+Hugo renders this to:
+
+```html
+<p>Call <a href="#make_widget">make_widget</a> to build a <strong>fast</strong> widget.</p>
+```
+
 [Content-Type]: https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Type
 [`index`]: /functions/collections/indexfunction/
 [page bundle]: /content-management/page-bundles/
+[`reflect.IsMap`]: /functions/reflect/ismap/

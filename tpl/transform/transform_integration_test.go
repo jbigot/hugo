@@ -517,6 +517,102 @@ DATA
 	}
 }
 
+func TestUnmarshalXMLDocument(t *testing.T) {
+	t.Parallel()
+
+	files := `
+-- hugo.toml --
+disableKinds = ['page','rss','section','sitemap','taxonomy','term']
+-- layouts/all.html --
+{{ $opts := OPTS }}
+{{ with resources.Get "doc.xml" | transform.Unmarshal $opts }}
+  {{ jsonify . }}
+{{ end }}
+-- assets/doc.xml --
+DATA
+`
+
+	const (
+		para     = `<para>Use <ref refid="namespacedemo_1a5d" kindref="member">make_widget</ref> to build one.</para>`
+		paraJSON = `{"attributes":{},"children":["Use ",{"attributes":{"kindref":"member","refid":"namespacedemo_1a5d"},"children":["make_widget"],"tag":"ref"}," to build one."],"tag":"para"}`
+	)
+
+	for _, test := range []struct {
+		name, opts, data string
+		want             string
+		err              string
+	}{
+		{"document", `dict "targetType" "document"`, para, paraJSON, ""},
+		{"document (no data)", `dict "targetType" "document"`, "", "! tag", ""},
+		{"slice", `dict "targetType" "slice"`, para, "", `invalid targetType for XML: expected either data or document, received slice`},
+		{"foo (no data)", `dict "targetType" "foo"`, "", "", `invalid targetType: expected either data or document, received foo`},
+		{"malformed", `dict "targetType" "document"`, "<a>\n\n\n  <b></c>\n</a>", "", `"_stream.xml:4:10": failed to unmarshal XML: XML syntax error on line 4: element <b> closed by </c>`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			f := strings.ReplaceAll(files, "OPTS", test.opts)
+			f = strings.ReplaceAll(f, "DATA", test.data)
+			if test.err != "" {
+				b, err := hugolib.TestE(t, f)
+				b.Assert(err, qt.IsNotNil)
+				b.Assert(err.Error(), qt.Contains, test.err)
+				b.Assert(err.Error(), qt.Contains, `"/layouts/all.html:2:`)
+				return
+			}
+			b := hugolib.Test(t, f)
+			b.AssertFileContent("public/index.html", test.want)
+		})
+	}
+}
+
+func TestUnmarshalXMLDocumentTemplates(t *testing.T) {
+	t.Parallel()
+
+	files := `
+-- hugo.toml --
+disableKinds = ['page','rss','section','sitemap','taxonomy','term']
+-- assets/doc.xml --
+<para>Use <ref refid="namespacedemo_1a5d" kindref="member">make_widget</ref> to build one, it is <bold>fast</bold> and <computeroutput>cheap</computeroutput>.</para>
+-- data/doc.xml --
+<para>Use <ref refid="namespacedemo_1a5d" kindref="member">make_widget</ref> to build one, it is <bold>fast</bold> and <computeroutput>cheap</computeroutput>.</para>
+-- layouts/_partials/render.html --
+{{- /* layouts/_partials/render.html */ -}}
+{{- range . -}}
+  {{- if reflect.IsMap . -}}
+    {{- if eq .tag "para" -}}<p>{{ partial "render.html" .children }}</p>
+    {{- else if eq .tag "bold" -}}<strong>{{ partial "render.html" .children }}</strong>
+    {{- else if eq .tag "computeroutput" -}}<code>{{ partial "render.html" .children }}</code>
+    {{- else if eq .tag "ref" -}}<a href="#{{ .attributes.refid }}">{{ partial "render.html" .children }}</a>
+    {{- end -}}
+  {{- else -}}
+    {{- . -}}
+  {{- end -}}
+{{- end -}}
+-- layouts/all.html --
+{{ $r := resources.Get "doc.xml" }}
+{{ $default := $r | transform.Unmarshal }}
+{{ $data := $r | transform.Unmarshal (dict "targetType" "data") }}
+{{ $doc := $r | transform.Unmarshal (dict "targetType" "document") }}
+cache: {{ eq (jsonify $data) (jsonify $default) }} {{ eq (jsonify $doc) (jsonify $default) }}|
+datadir: {{ eq (jsonify hugo.Data.doc) (jsonify $default) }}|
+render: {{ partial "render.html" (slice $doc) }}|
+{{ $ref := index $doc.children 1 }}
+attrs: {{ index $ref.attributes "refid" }}|{{ index $ref.attributes "nope" }}|{{ isset $ref.attributes "refid" }}|{{ isset $ref.attributes "nope" }}|{{ range $k, $v := $ref.attributes }}{{ $k }}={{ $v }};{{ end }}|{{ jsonify (merge $ref.attributes (dict "x" "y")) }}|
+string: {{ transform.Unmarshal (dict "targetType" "document") "<p>a<b>c</b></p>" | jsonify }}|
+`
+
+	b := hugolib.Test(t, files)
+
+	b.AssertFileContent("public/index.html", `
+cache: true false|
+datadir: true|
+render: <p>Use <a href="#namespacedemo_1a5d">make_widget</a> to build one, it is <strong>fast</strong> and <code>cheap</code>.</p>|
+attrs: namespacedemo_1a5d||true|false|kindref=member;refid=namespacedemo_1a5d;|{"kindref":"member","refid":"namespacedemo_1a5d","x":"y"}|
+string: {"attributes":{},"children":["a",{"attributes":{},"children":["c"],"tag":"b"}],"tag":"p"}|
+`)
+}
+
 // Issue 13729
 func TestToMathStrictMode(t *testing.T) {
 	t.Parallel()

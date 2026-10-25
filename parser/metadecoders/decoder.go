@@ -17,6 +17,7 @@ import (
 	"bytes"
 	"encoding/csv"
 	"encoding/json"
+	stdxml "encoding/xml"
 	"fmt"
 	"log"
 	"regexp"
@@ -27,6 +28,7 @@ import (
 	"github.com/gohugoio/hugo/common/herrors"
 	"github.com/gohugoio/hugo/common/hmaps"
 	"github.com/gohugoio/hugo/common/hugio"
+	"github.com/gohugoio/hugo/common/text"
 	"github.com/niklasfasching/go-org/org"
 
 	xml "github.com/clbanning/mxj/v2"
@@ -55,8 +57,9 @@ type Decoder struct {
 	// may appear in a quoted field. Used in the CSV decoder. Default is false.
 	LazyQuotes bool
 
-	// The target data type, either slice or map. Used in the CSV decoder.
-	// Default is slice.
+	// The target layout. Used in the CSV decoder, either slice or map
+	// (default slice), and in the XML decoder, either data or document
+	// (default data).
 	TargetType string
 }
 
@@ -73,8 +76,7 @@ func (d Decoder) OptionsKey() string {
 
 // Default is a Decoder in its default configuration.
 var Default = Decoder{
-	Delimiter:  ',',
-	TargetType: "slice",
+	Delimiter: ',',
 }
 
 // UnmarshalToMap will unmarshall data in format f into a new map. This is
@@ -149,10 +151,17 @@ func (d Decoder) Unmarshal(data []byte, f Format) (any, error) {
 			switch d.TargetType {
 			case "map":
 				return make(map[string]any), nil
-			case "slice":
+			case "", "slice":
 				return make([][]string, 0), nil
 			default:
 				return nil, fmt.Errorf("invalid targetType: expected either slice or map, received %s", d.TargetType)
+			}
+		case XML:
+			switch d.TargetType {
+			case "", "data", "document":
+				return make(map[string]any), nil
+			default:
+				return nil, fmt.Errorf("invalid targetType: expected either data or document, received %s", d.TargetType)
 			}
 		default:
 			return make(map[string]any), nil
@@ -285,28 +294,36 @@ func (d Decoder) UnmarshalTo(data []byte, f Format, v any) error {
 	case JSON:
 		err = json.Unmarshal(data, v)
 	case XML:
-		var xmlRoot xml.Map
-		xmlRoot, err = xml.NewMapXml(data)
-
 		var xmlValue map[string]any
-		if err == nil {
-			xmlRootName, err := xmlRoot.Root()
-			if err != nil {
-				return toFileError(f, data, fmt.Errorf("failed to unmarshal XML: %w", err))
-			}
+		switch d.TargetType {
+		case "", "data":
+			var xmlRoot xml.Map
+			xmlRoot, err = xml.NewMapXml(data)
+			if err == nil {
+				xmlRootName, err := xmlRoot.Root()
+				if err != nil {
+					return toFileError(f, data, fmt.Errorf("failed to unmarshal XML: %w", err))
+				}
 
-			// Get the root value and verify it's a map
-			rootValue := xmlRoot[xmlRootName]
-			if rootValue == nil {
-				return toFileError(f, data, fmt.Errorf("XML root element '%s' has no value", xmlRootName))
-			}
+				// Get the root value and verify it's a map
+				rootValue := xmlRoot[xmlRootName]
+				if rootValue == nil {
+					return toFileError(f, data, fmt.Errorf("XML root element '%s' has no value", xmlRootName))
+				}
 
-			// Type check before conversion
-			mapValue, ok := rootValue.(map[string]any)
-			if !ok {
-				return toFileError(f, data, fmt.Errorf("XML root element '%s' must be a map/object, got %T", xmlRootName, rootValue))
+				// Type check before conversion
+				mapValue, ok := rootValue.(map[string]any)
+				if !ok {
+					return toFileError(f, data, fmt.Errorf("XML root element '%s' must be a map/object, got %T", xmlRootName, rootValue))
+				}
+				xmlValue = mapValue
 			}
-			xmlValue = mapValue
+		case "document":
+			if err := d.unmarshalXMLDocument(data, &xmlValue); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("invalid targetType for XML: expected either data or document, received %s", d.TargetType)
 		}
 
 		switch v := v.(type) {
@@ -369,7 +386,7 @@ func (d Decoder) unmarshalCSV(data []byte, v any) error {
 				sm[i] = m
 			}
 			*vv = sm
-		case "slice":
+		case "", "slice":
 			*vv = records
 		default:
 			return fmt.Errorf("cannot unmarshal CSV into %T: invalid targetType: expected either slice or map, received %s", v, d.TargetType)
@@ -378,6 +395,71 @@ func (d Decoder) unmarshalCSV(data []byte, v any) error {
 		return fmt.Errorf("cannot unmarshal CSV into %T", v)
 	}
 
+	return nil
+}
+
+// unmarshalXMLDocument decodes XML data into an order-preserving "document-oriented" tree of elements.
+func (d Decoder) unmarshalXMLDocument(data []byte, xmlValue *map[string]any) error {
+	type frame struct {
+		tag        string
+		attributes map[string]string
+		children   []any
+	}
+
+	var (
+		stack       []frame
+		result      map[string]any
+		currentText strings.Builder
+	)
+
+	addChild := func(child any) {
+		top := &stack[len(stack)-1]
+		top.children = append(top.children, child)
+	}
+
+	addCurrentTextAsChild := func() {
+		if currentText.Len() > 0 {
+			addChild(currentText.String())
+			currentText.Reset()
+		}
+	}
+
+	dec := stdxml.NewDecoder(bytes.NewReader(data))
+
+	for result == nil {
+		tok, err := dec.Token()
+		if err != nil {
+			line, col := dec.InputPos()
+			return herrors.NewFileErrorFromPos(
+				fmt.Errorf("failed to unmarshal XML: %w", err),
+				text.Position{Filename: fmt.Sprintf("_stream.%s", XML), Offset: -1, LineNumber: line, ColumnNumber: col},
+			).UpdateContent(bytes.NewReader(data), nil)
+		}
+		switch tok := tok.(type) {
+		case stdxml.StartElement:
+			addCurrentTextAsChild()
+			attributes := make(map[string]string, len(tok.Attr))
+			for _, attr := range tok.Attr {
+				attributes[attr.Name.Local] = attr.Value
+			}
+			stack = append(stack, frame{tok.Name.Local, attributes, []any{}})
+		case stdxml.EndElement:
+			addCurrentTextAsChild()
+			popped := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			if len(stack) == 0 {
+				result = map[string]any{"tag": popped.tag, "attributes": popped.attributes, "children": popped.children}
+			} else {
+				addChild(map[string]any{"tag": popped.tag, "attributes": popped.attributes, "children": popped.children})
+			}
+		case stdxml.CharData:
+			if len(stack) > 0 {
+				currentText.Write(tok)
+			}
+		}
+	}
+
+	*xmlValue = result
 	return nil
 }
 

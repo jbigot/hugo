@@ -75,6 +75,56 @@ func TestUnmarshalXML(t *testing.T) {
 	c.Assert(m, qt.DeepEquals, expect)
 }
 
+func TestUnmarshalXMLDocument(t *testing.T) {
+	c := qt.New(t)
+
+	d := Default
+	d.TargetType = "document"
+
+	el := func(tag string, attributes map[string]string, children ...any) map[string]any {
+		if attributes == nil {
+			attributes = map[string]string{}
+		}
+		if children == nil {
+			children = []any{}
+		}
+		return map[string]any{"tag": tag, "attributes": attributes, "children": children}
+	}
+
+	for i, test := range []struct {
+		data   string
+		expect any
+	}{
+		{
+			`<para>Use <ref refid="namespacedemo_1a5d" kindref="member">make_widget</ref> to build one, it is <bold>fast</bold>.</para>`,
+			el("para", nil, "Use ", el("ref", map[string]string{"kindref": "member", "refid": "namespacedemo_1a5d"}, "make_widget"), " to build one, it is ", el("bold", nil, "fast"), "."),
+		},
+		{`<r><b/><a/><b/></r>`, el("r", nil, el("b", nil), el("a", nil), el("b", nil))},
+		{`<r>t</r>`, el("r", nil, "t")},
+		{"<r>\n  <a/>\n</r>", el("r", nil, "\n  ", el("a", nil), "\n")},
+		{`<r>a<![CDATA[b]]>c<!--d-->e<?pi f?>g</r>`, el("r", nil, "abceg")},
+		{"<?xml version=\"1.0\"?>\n<!DOCTYPE r>\n<!-- c -->\n<r/>\n<!-- c -->\n", el("r", nil)},
+		{"x<r/>\nx<b/></r><a", el("r", nil)},
+		{
+			`<r xmlns="urn:d" xmlns:atom="urn:a" xml:lang="en"><atom:link atom:href="x" href="y"/></r>`,
+			el("r", map[string]string{"xmlns": "urn:d", "atom": "urn:a", "lang": "en"}, el("link", map[string]string{"href": "y"})),
+		},
+		{``, map[string]any{}},
+		// errors
+		{"<a>\n  <b></c>\n</a>", false},
+		{`<!-- c -->`, false},
+	} {
+		msg := qt.Commentf("%d: %s", i, test.data)
+		m, err := d.Unmarshal([]byte(test.data), XML)
+		if b, ok := test.expect.(bool); ok && !b {
+			c.Assert(err, qt.Not(qt.IsNil), msg)
+		} else {
+			c.Assert(err, qt.IsNil, msg)
+			c.Assert(m, qt.DeepEquals, test.expect, msg)
+		}
+	}
+}
+
 func TestUnmarshalToMap(t *testing.T) {
 	c := qt.New(t)
 
