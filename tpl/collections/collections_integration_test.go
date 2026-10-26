@@ -718,3 +718,17 @@ uniq: {{ uniq (slice 9007199254740993 9007199254740992 9007199254740992.0) }}|
 		"uniq: [9007199254740993 9007199254740992]|",
 	)
 }
+
+func TestMergeMapsOfStrings(t *testing.T) {
+	t.Parallel()
+
+	files := `
+-- hugo.toml --
+disableKinds = ["page", "section", "taxonomy", "term", "rss", "sitemap", "404"]
+-- layouts/home.html --
+{{ $rows := transform.Unmarshal (dict "targetType" "map") "a,b\n1,2\n3,4\n" }}
+merged: {{ jsonify (merge (index $rows 0) (index $rows 1)) }}|
+`
+
+	hugolib.Test(t, files).AssertFileContent("public/index.html", `merged: {"a":"3","b":"4"}|`)
+}
