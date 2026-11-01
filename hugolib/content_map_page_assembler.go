@@ -314,6 +314,12 @@ func (a *allPagesAssembler) doCreatePages(prefix string, depth int) error {
 					}
 					w2 = p.contentWeight()
 
+					if found && !replaceVector && w1 > 0 && w1 == w2 && site.conf.PrintPathWarnings && !a.h.isRebuild() {
+						if pps, ok := pp.(*pageState); ok && pps.m.pageMetaSource != ms {
+							site.Log.Warnf("Duplicate content path: %q file: %q file: %q", s, pps.File().Filename(), p.File().Filename())
+						}
+					}
+
 					if found && !replaceVector && w1 > w2 {
 						return true
 					}

@@ -119,9 +119,16 @@ func mergeMap(dst, src reflect.Value) reflect.Value {
 
 		if found {
 			// If both are the same map key type, merge.
-			dve := dv.Elem()
+			// The values are interfaces only in maps of interfaces, such as map[string]any.
+			dve := dv
+			if dve.Kind() == reflect.Interface {
+				dve = dve.Elem()
+			}
 			if dve.Kind() == reflect.Map {
-				sve := sv.Elem()
+				sve := sv
+				if sve.Kind() == reflect.Interface {
+					sve = sve.Elem()
+				}
 				if sve.Kind() != reflect.Map {
 					continue
 				}
