@@ -972,3 +972,25 @@ templateMetrics = true
 	b.Assert(got, qt.Contains, "/docs/_content.gotmpl")
 	b.Assert(got, qt.Not(qt.Contains), "content/docs/_content.gotmpl")
 }
+
+func TestPagesFromGoTmplWithPartial(t *testing.T) {
+	t.Parallel()
+
+	files := `
+-- hugo.toml --
+disableKinds = ["taxonomy", "term", "rss", "sitemap"]
+-- layouts/all.html --
+{{ .Title }}|
+-- layouts/_partials/title.html --
+{{ return "Moby Dick" }}
+-- layouts/_partials/book.html --
+{{ with partial "title.html" . }}{{ return . }}{{ end }}{{ return "" }}
+-- content/books/_content.gotmpl --
+{{ $.AddPage (dict "path" "p1" "title" (partial "book.html" .)) }}
+{{ $.AddPage (dict "path" "p2" "title" (partialCached "book.html" .)) }}
+`
+	b := hugolib.Test(t, files)
+
+	b.AssertFileContent("public/books/p1/index.html", "Moby Dick|")
+	b.AssertFileContent("public/books/p2/index.html", "Moby Dick|")
+}

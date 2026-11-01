@@ -352,6 +352,7 @@ func (p *PagesFromTemplate) Execute(ctx context.Context) (BuildInfo, error) {
 		p: p,
 	}
 
+	ctx = p.TemplateStore.PrepareTopLevelRenderCtx(ctx, nil)
 	ctx = tpl.Context.DependencyManagerScopedProvider.Set(ctx, p)
 
 	if err := p.TemplateStore.ExecuteWithContext(ctx, tmpl, io.Discard, data); err != nil {
